@@ -8,15 +8,15 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 
 public class Processor {
+
+    private static final int CHUNK_BUF_SIZE = 4 * 1024 * 1024;
 
     public static void process(String inputPath, String outputPath) {
         try (RandomAccessFile raf = new RandomAccessFile(inputPath, "r");
@@ -46,6 +46,8 @@ public class Processor {
             }
             boundaries.add(new long[]{start, fileSize});
 
+            HashMap<Long, String> pathLookup = buildPathLookup(mapped);
+
             List<Callable<HashMap<Long, HashMap<Long, Long>>>> tasks = new ArrayList<>();
             for (long[] range : boundaries) {
                 long cStart = range[0];
@@ -62,96 +64,108 @@ public class Processor {
                 }
             }
 
-            writeJson(result, mapped, outputPath);
+            writeJson(result, pathLookup, outputPath);
             System.err.println("Processed " + result.size() + " unique paths to " + outputPath);
         } catch (Exception e) {
             throw new RuntimeException("Failed to process data", e);
         }
     }
 
-    private static long encodePath(MemorySegment seg, long pathStart, int pathLen) {
+    private static long encodePath(byte[] data, int pathStart, int pathLen) {
         long hash = pathLen;
         for (int i = 0; i < Math.min(pathLen, 8); i++) {
-            hash = hash * 31 + (seg.get(ValueLayout.JAVA_BYTE, pathStart + i) & 0xFF);
+            hash = hash * 31 + (data[pathStart + i] & 0xFF);
         }
         if (pathLen > 8) {
             for (int i = pathLen - 4; i < pathLen; i++) {
-                hash = hash * 31 + (seg.get(ValueLayout.JAVA_BYTE, pathStart + i) & 0xFF);
+                hash = hash * 31 + (data[pathStart + i] & 0xFF);
             }
         }
         return hash;
     }
 
-    private static long encodeDate(MemorySegment seg, long dateStart) {
-        int y = (seg.get(ValueLayout.JAVA_BYTE, dateStart) - '0') * 1000 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 1) - '0') * 100 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 2) - '0') * 10 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 3) - '0');
-        int m = (seg.get(ValueLayout.JAVA_BYTE, dateStart + 5) - '0') * 10 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 6) - '0');
-        int d = (seg.get(ValueLayout.JAVA_BYTE, dateStart + 8) - '0') * 10 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 9) - '0');
+    private static long encodeDate(byte[] data, int dateStart) {
+        int y = (data[dateStart] - '0') * 1000 +
+                (data[dateStart + 1] - '0') * 100 +
+                (data[dateStart + 2] - '0') * 10 +
+                (data[dateStart + 3] - '0');
+        int m = (data[dateStart + 5] - '0') * 10 +
+                (data[dateStart + 6] - '0');
+        int d = (data[dateStart + 8] - '0') * 10 +
+                (data[dateStart + 9] - '0');
         return y * 10000L + m * 100L + d;
     }
 
     private static HashMap<Long, HashMap<Long, Long>> processChunk(MemorySegment seg, long start, long end) {
         HashMap<Long, HashMap<Long, Long>> map = new HashMap<>(64);
         long pos = start;
+        byte[] buf = new byte[CHUNK_BUF_SIZE];
 
         while (pos < end) {
-            long lineEnd = pos;
-            while (lineEnd < end && seg.get(ValueLayout.JAVA_BYTE, lineEnd) != '\n') {
-                lineEnd++;
+            int toRead = (int) Math.min(CHUNK_BUF_SIZE, end - pos);
+            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, pos, buf, 0, toRead);
+
+            int lastNewline = toRead;
+            if (pos + toRead < end) {
+                lastNewline = toRead - 1;
+                while (lastNewline >= 0 && buf[lastNewline] != '\n') {
+                    lastNewline--;
+                }
+                if (lastNewline < 0) {
+                    pos += toRead;
+                    continue;
+                }
+                lastNewline++;
             }
 
-            if (lineEnd > pos) {
-                long commaPos = lineEnd - 1;
-                while (commaPos > pos && seg.get(ValueLayout.JAVA_BYTE, commaPos) != ',') {
-                    commaPos--;
+            int p = 0;
+            while (p < lastNewline) {
+                int lineEnd = p;
+                while (lineEnd < lastNewline && buf[lineEnd] != '\n') {
+                    lineEnd++;
                 }
 
-                if (commaPos > pos && commaPos + 11 <= lineEnd) {
-                    long urlStart = pos;
-                    long urlEnd = commaPos;
-                    long dateStart = commaPos + 1;
+                if (lineEnd > p) {
+                    int commaPos = lineEnd - 1;
+                    while (commaPos > p && buf[commaPos] != ',') {
+                        commaPos--;
+                    }
 
-                    long pathStart = -1;
-                    long p = urlStart;
-                    while (p < urlEnd - 2) {
-                        if (seg.get(ValueLayout.JAVA_BYTE, p) == ':' &&
-                            seg.get(ValueLayout.JAVA_BYTE, p + 1) == '/' &&
-                            seg.get(ValueLayout.JAVA_BYTE, p + 2) == '/') {
-                            long afterProtocol = p + 3;
-                            while (afterProtocol < urlEnd) {
-                                if (seg.get(ValueLayout.JAVA_BYTE, afterProtocol) == '/') {
-                                    pathStart = afterProtocol;
-                                    break;
-                                }
-                                afterProtocol++;
+                    if (commaPos > p && commaPos + 11 <= lineEnd) {
+                        int pathStart = findPathStart(buf, p, commaPos);
+                        if (pathStart >= 0) {
+                            int pathLen = commaPos - pathStart;
+                            long pathKey = encodePath(buf, pathStart, pathLen);
+                            long dateKey = encodeDate(buf, commaPos + 1);
+
+                            HashMap<Long, Long> dates = map.get(pathKey);
+                            if (dates == null) {
+                                dates = new HashMap<>(1024);
+                                map.put(pathKey, dates);
                             }
-                            break;
+                            dates.merge(dateKey, 1L, Long::sum);
                         }
-                        p++;
-                    }
-
-                    if (pathStart >= 0) {
-                        int pathLen = (int)(urlEnd - pathStart);
-                        long pathKey = encodePath(seg, pathStart, pathLen);
-                        long dateKey = encodeDate(seg, dateStart);
-
-                        HashMap<Long, Long> dates = map.get(pathKey);
-                        if (dates == null) {
-                            dates = new HashMap<>(1024);
-                            map.put(pathKey, dates);
-                        }
-                        dates.merge(dateKey, 1L, Long::sum);
                     }
                 }
+                p = lineEnd + 1;
             }
-            pos = lineEnd + 1;
+
+            pos += lastNewline;
         }
 
         return map;
+    }
+
+    private static int findPathStart(byte[] buf, int start, int end) {
+        for (int i = start; i < end - 2; i++) {
+            if (buf[i] == ':' && buf[i + 1] == '/' && buf[i + 2] == '/') {
+                for (int j = i + 3; j < end; j++) {
+                    if (buf[j] == '/') return j;
+                }
+                return -1;
+            }
+        }
+        return -1;
     }
 
     private static void mergeMaps(HashMap<Long, HashMap<Long, Long>> a,
@@ -176,9 +190,7 @@ public class Processor {
     }
 
     private static void writeJson(HashMap<Long, HashMap<Long, Long>> map,
-                                   MemorySegment seg, String outputPath) throws Exception {
-        HashMap<Long, String> pathLookup = buildPathLookup(seg);
-
+                                   HashMap<Long, String> pathLookup, String outputPath) throws Exception {
         TreeMap<String, TreeMap<String, Long>> sorted = new TreeMap<>();
         for (var entry : map.entrySet()) {
             String path = pathLookup.getOrDefault(entry.getKey(), "unknown-" + entry.getKey());
@@ -226,46 +238,31 @@ public class Processor {
     private static HashMap<Long, String> buildPathLookup(MemorySegment seg) {
         HashMap<Long, String> lookup = new HashMap<>(64);
         long fileSize = seg.byteSize();
-        long pos = 0;
-        int found = 0;
+        byte[] buf = new byte[(int) Math.min(CHUNK_BUF_SIZE, fileSize)];
+        int toRead = buf.length;
+        MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, 0, buf, 0, toRead);
 
-        while (pos < fileSize && found < 200) {
-            long lineEnd = pos;
-            while (lineEnd < fileSize && seg.get(ValueLayout.JAVA_BYTE, lineEnd) != '\n') {
+        int pos = 0;
+        while (pos < toRead && lookup.size() < 200) {
+            int lineEnd = pos;
+            while (lineEnd < toRead && buf[lineEnd] != '\n') {
                 lineEnd++;
             }
 
             if (lineEnd > pos) {
-                long commaPos = lineEnd - 1;
-                while (commaPos > pos && seg.get(ValueLayout.JAVA_BYTE, commaPos) != ',') {
+                int commaPos = lineEnd - 1;
+                while (commaPos > pos && buf[commaPos] != ',') {
                     commaPos--;
                 }
 
                 if (commaPos > pos) {
-                    long urlEnd = commaPos;
-                    long p = pos;
-                    while (p < urlEnd - 2) {
-                        if (seg.get(ValueLayout.JAVA_BYTE, p) == ':' &&
-                            seg.get(ValueLayout.JAVA_BYTE, p + 1) == '/' &&
-                            seg.get(ValueLayout.JAVA_BYTE, p + 2) == '/') {
-                            long afterProtocol = p + 3;
-                            while (afterProtocol < urlEnd) {
-                                if (seg.get(ValueLayout.JAVA_BYTE, afterProtocol) == '/') {
-                                    int pathLen = (int)(urlEnd - afterProtocol);
-                                    long key = encodePath(seg, afterProtocol, pathLen);
-                                    if (!lookup.containsKey(key)) {
-                                        byte[] pathBytes = new byte[pathLen];
-                                        MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, afterProtocol, pathBytes, 0, pathLen);
-                                        lookup.put(key, new String(pathBytes));
-                                        found++;
-                                    }
-                                    break;
-                                }
-                                afterProtocol++;
-                            }
-                            break;
+                    int pathStart = findPathStart(buf, pos, commaPos);
+                    if (pathStart >= 0) {
+                        int pathLen = commaPos - pathStart;
+                        long key = encodePath(buf, pathStart, pathLen);
+                        if (!lookup.containsKey(key)) {
+                            lookup.put(key, new String(buf, pathStart, pathLen));
                         }
-                        p++;
                     }
                 }
             }
