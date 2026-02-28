@@ -16,8 +16,6 @@ import java.util.concurrent.Executors;
 
 public class Processor {
 
-    private static final int CHUNK_BUF_SIZE = 4 * 1024 * 1024;
-
     public static void process(String inputPath, String outputPath) {
         try (RandomAccessFile raf = new RandomAccessFile(inputPath, "r");
              FileChannel channel = raf.getChannel();
@@ -46,17 +44,15 @@ public class Processor {
             }
             boundaries.add(new long[]{start, fileSize});
 
-            HashMap<Long, String> pathLookup = buildPathLookup(mapped);
-
-            List<Callable<HashMap<Long, HashMap<Long, Long>>>> tasks = new ArrayList<>();
+            List<Callable<HashMap<String, LongLongMap>>> tasks = new ArrayList<>();
             for (long[] range : boundaries) {
                 long cStart = range[0];
                 long cEnd = range[1];
                 tasks.add(() -> processChunk(mapped, cStart, cEnd));
             }
 
-            HashMap<Long, HashMap<Long, Long>> result;
-            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            HashMap<String, LongLongMap> result;
+            try (var executor = Executors.newFixedThreadPool(numThreads)) {
                 var futures = executor.invokeAll(tasks);
                 result = futures.getFirst().get();
                 for (int i = 1; i < futures.size(); i++) {
@@ -64,103 +60,61 @@ public class Processor {
                 }
             }
 
-            writeJson(result, pathLookup, outputPath);
+            writeJson(result, outputPath);
             System.err.println("Processed " + result.size() + " unique paths to " + outputPath);
         } catch (Exception e) {
             throw new RuntimeException("Failed to process data", e);
         }
     }
 
-    private static long encodePath(byte[] data, int pathStart, int pathLen) {
-        long hash = pathLen;
-        for (int i = 0; i < Math.min(pathLen, 8); i++) {
-            hash = hash * 31 + (data[pathStart + i] & 0xFF);
-        }
-        if (pathLen > 8) {
-            for (int i = pathLen - 4; i < pathLen; i++) {
-                hash = hash * 31 + (data[pathStart + i] & 0xFF);
-            }
-        }
-        return hash;
-    }
-
-    private static long encodeDate(byte[] data, int dateStart) {
-        int y = (data[dateStart] - '0') * 1000 +
-                (data[dateStart + 1] - '0') * 100 +
-                (data[dateStart + 2] - '0') * 10 +
-                (data[dateStart + 3] - '0');
-        int m = (data[dateStart + 5] - '0') * 10 +
-                (data[dateStart + 6] - '0');
-        int d = (data[dateStart + 8] - '0') * 10 +
-                (data[dateStart + 9] - '0');
-        return y * 10000L + m * 100L + d;
-    }
-
-    private static HashMap<Long, HashMap<Long, Long>> processChunk(MemorySegment seg, long start, long end) {
-        HashMap<Long, HashMap<Long, Long>> map = new HashMap<>(64);
+    private static HashMap<String, LongLongMap> processChunk(MemorySegment seg, long start, long end) {
+        HashMap<String, LongLongMap> map = new HashMap<>(64);
         long pos = start;
-        byte[] buf = new byte[CHUNK_BUF_SIZE];
 
         while (pos < end) {
-            int toRead = (int) Math.min(CHUNK_BUF_SIZE, end - pos);
-            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, pos, buf, 0, toRead);
-
-            int lastNewline = toRead;
-            if (pos + toRead < end) {
-                lastNewline = toRead - 1;
-                while (lastNewline >= 0 && buf[lastNewline] != '\n') {
-                    lastNewline--;
-                }
-                if (lastNewline < 0) {
-                    pos += toRead;
-                    continue;
-                }
-                lastNewline++;
+            long lineEnd = pos;
+            while (lineEnd < end && seg.get(ValueLayout.JAVA_BYTE, lineEnd) != '\n') {
+                lineEnd++;
             }
 
-            int p = 0;
-            while (p < lastNewline) {
-                int lineEnd = p;
-                while (lineEnd < lastNewline && buf[lineEnd] != '\n') {
-                    lineEnd++;
+            if (lineEnd > pos) {
+                long commaPos = lineEnd - 1;
+                while (commaPos > pos && seg.get(ValueLayout.JAVA_BYTE, commaPos) != ',') {
+                    commaPos--;
                 }
 
-                if (lineEnd > p) {
-                    int commaPos = lineEnd - 1;
-                    while (commaPos > p && buf[commaPos] != ',') {
-                        commaPos--;
-                    }
+                if (commaPos > pos && commaPos + 11 <= lineEnd) {
+                    long pathStart = findPathStart(seg, pos, commaPos);
+                    if (pathStart >= 0) {
+                        int pathLen = (int)(commaPos - pathStart);
+                        byte[] pathBytes = new byte[pathLen];
+                        MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, pathStart, pathBytes, 0, pathLen);
+                        String path = new String(pathBytes).intern();
 
-                    if (commaPos > p && commaPos + 11 <= lineEnd) {
-                        int pathStart = findPathStart(buf, p, commaPos);
-                        if (pathStart >= 0) {
-                            int pathLen = commaPos - pathStart;
-                            long pathKey = encodePath(buf, pathStart, pathLen);
-                            long dateKey = encodeDate(buf, commaPos + 1);
+                        long dateKey = encodeDate(seg, commaPos + 1);
 
-                            HashMap<Long, Long> dates = map.get(pathKey);
-                            if (dates == null) {
-                                dates = new HashMap<>(1024);
-                                map.put(pathKey, dates);
-                            }
-                            dates.merge(dateKey, 1L, Long::sum);
+                        LongLongMap dates = map.get(path);
+                        if (dates == null) {
+                            dates = new LongLongMap();
+                            map.put(path, dates);
                         }
+                        dates.addTo(dateKey, 1L);
                     }
                 }
-                p = lineEnd + 1;
             }
-
-            pos += lastNewline;
+            pos = lineEnd + 1;
         }
 
         return map;
     }
 
-    private static int findPathStart(byte[] buf, int start, int end) {
-        for (int i = start; i < end - 2; i++) {
-            if (buf[i] == ':' && buf[i + 1] == '/' && buf[i + 2] == '/') {
-                for (int j = i + 3; j < end; j++) {
-                    if (buf[j] == '/') return j;
+    private static long findPathStart(MemorySegment seg, long start, long end) {
+        for (long i = start; i < end - 2; i++) {
+            if (seg.get(ValueLayout.JAVA_BYTE, i) == ':' &&
+                seg.get(ValueLayout.JAVA_BYTE, i + 1) == '/' &&
+                seg.get(ValueLayout.JAVA_BYTE, i + 2) == '/') {
+                for (long j = i + 3; j < end; j++) {
+                    if (seg.get(ValueLayout.JAVA_BYTE, j) == '/') return j;
                 }
                 return -1;
             }
@@ -168,16 +122,26 @@ public class Processor {
         return -1;
     }
 
-    private static void mergeMaps(HashMap<Long, HashMap<Long, Long>> a,
-                                   HashMap<Long, HashMap<Long, Long>> b) {
+    private static long encodeDate(MemorySegment seg, long dateStart) {
+        int y = (seg.get(ValueLayout.JAVA_BYTE, dateStart) - '0') * 1000 +
+                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 1) - '0') * 100 +
+                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 2) - '0') * 10 +
+                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 3) - '0');
+        int m = (seg.get(ValueLayout.JAVA_BYTE, dateStart + 5) - '0') * 10 +
+                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 6) - '0');
+        int d = (seg.get(ValueLayout.JAVA_BYTE, dateStart + 8) - '0') * 10 +
+                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 9) - '0');
+        return y * 10000L + m * 100L + d;
+    }
+
+    private static void mergeMaps(HashMap<String, LongLongMap> a,
+                                   HashMap<String, LongLongMap> b) {
         for (var entry : b.entrySet()) {
-            HashMap<Long, Long> existing = a.get(entry.getKey());
+            LongLongMap existing = a.get(entry.getKey());
             if (existing == null) {
                 a.put(entry.getKey(), entry.getValue());
             } else {
-                for (var dateEntry : entry.getValue().entrySet()) {
-                    existing.merge(dateEntry.getKey(), dateEntry.getValue(), Long::sum);
-                }
+                existing.mergeFrom(entry.getValue());
             }
         }
     }
@@ -186,19 +150,24 @@ public class Processor {
         int d = (int)(encoded % 100); encoded /= 100;
         int m = (int)(encoded % 100); encoded /= 100;
         int y = (int)encoded;
-        return String.format("%04d-%02d-%02d", y, m, d);
+        StringBuilder sb = new StringBuilder(10);
+        if (y < 1000) sb.append('0');
+        if (y < 100) sb.append('0');
+        if (y < 10) sb.append('0');
+        sb.append(y).append('-');
+        if (m < 10) sb.append('0');
+        sb.append(m).append('-');
+        if (d < 10) sb.append('0');
+        sb.append(d);
+        return sb.toString();
     }
 
-    private static void writeJson(HashMap<Long, HashMap<Long, Long>> map,
-                                   HashMap<Long, String> pathLookup, String outputPath) throws Exception {
+    private static void writeJson(HashMap<String, LongLongMap> map, String outputPath) throws Exception {
         TreeMap<String, TreeMap<String, Long>> sorted = new TreeMap<>();
         for (var entry : map.entrySet()) {
-            String path = pathLookup.getOrDefault(entry.getKey(), "unknown-" + entry.getKey());
             TreeMap<String, Long> dates = new TreeMap<>();
-            for (var dateEntry : entry.getValue().entrySet()) {
-                dates.put(decodeDate(dateEntry.getKey()), dateEntry.getValue());
-            }
-            sorted.put(path, dates);
+            entry.getValue().forEach((dateKey, count) -> dates.put(decodeDate(dateKey), count));
+            sorted.put(entry.getKey(), dates);
         }
 
         try (BufferedWriter out = new BufferedWriter(new FileWriter(outputPath), 1024 * 1024)) {
@@ -233,42 +202,5 @@ public class Processor {
 
             out.write("}\n");
         }
-    }
-
-    private static HashMap<Long, String> buildPathLookup(MemorySegment seg) {
-        HashMap<Long, String> lookup = new HashMap<>(64);
-        long fileSize = seg.byteSize();
-        byte[] buf = new byte[(int) Math.min(CHUNK_BUF_SIZE, fileSize)];
-        int toRead = buf.length;
-        MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, 0, buf, 0, toRead);
-
-        int pos = 0;
-        while (pos < toRead && lookup.size() < 200) {
-            int lineEnd = pos;
-            while (lineEnd < toRead && buf[lineEnd] != '\n') {
-                lineEnd++;
-            }
-
-            if (lineEnd > pos) {
-                int commaPos = lineEnd - 1;
-                while (commaPos > pos && buf[commaPos] != ',') {
-                    commaPos--;
-                }
-
-                if (commaPos > pos) {
-                    int pathStart = findPathStart(buf, pos, commaPos);
-                    if (pathStart >= 0) {
-                        int pathLen = commaPos - pathStart;
-                        long key = encodePath(buf, pathStart, pathLen);
-                        if (!lookup.containsKey(key)) {
-                            lookup.put(key, new String(buf, pathStart, pathLen));
-                        }
-                    }
-                }
-            }
-            pos = lineEnd + 1;
-        }
-
-        return lookup;
     }
 }

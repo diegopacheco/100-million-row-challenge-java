@@ -1,17 +1,12 @@
 #!/bin/bash
-./build.sh
+./build-native.sh || exit 1
 
 echo "=== Generating 100,000,000 rows ==="
-java -cp target/classes challenge.Main generate 100000000
+./target/challenge-native generate 100000000
 
 echo ""
 echo "=== Processing measurements.txt ==="
-java -cp target/classes \
-  -Xmx8g \
-  -XX:+UseParallelGC \
-  -XX:+AlwaysPreTouch \
-  -XX:-TieredCompilation \
-  challenge.Main process
+./target/challenge-native process
 
 echo ""
 echo "=== Done ==="
