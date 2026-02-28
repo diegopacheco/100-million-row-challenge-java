@@ -209,18 +209,17 @@ Output written to target/data/output.json
 * 100MRC Zig -> https://github.com/diegopacheco/100-million-row-challenge-zig
 * 1000RC Java 25 -> https://github.com/diegopacheco/100-million-row-challenge-java
 
-
 ### Comparison
 
 ```
   ┌───────────────────┬───────────────────────────────┬────────────────────────────────┬──────────────────────────────────────────┐
   │      Aspect       │              Zig              │             Rust               │              Java 25                     │
   ├───────────────────┼───────────────────────────────┼────────────────────────────────┼──────────────────────────────────────────┤
-  │ Time              │ 0.765s                        │ 1.031s                         │ 2.063s (JVM) / 1.670s (Native)           │
+  │ Time              │ 0.765s                        │ 1.031s                         │ 1.670s (native) / 2.063s (jvm)           │
   ├───────────────────┼───────────────────────────────┼────────────────────────────────┼──────────────────────────────────────────┤
-  │ Throughput        │ ~130.7M rows/s                │ ~97.0M rows/s                  │ ~48.5M (JVM) / ~59.9M (Native) rows/s   │
+  │ Throughput        │ ~130.7M rows/s                │ ~97.0M rows/s                  │ ~59.9M (native) / ~48.5M (jvm) rows/s   │
   ├───────────────────┼───────────────────────────────┼────────────────────────────────┼──────────────────────────────────────────┤
-  │ vs Fastest        │ 1.0x (baseline)               │ 1.35x slower                   │ 2.70x (JVM) / 2.18x (Native) slower     │
+  │ vs Fastest        │ 1.0x (baseline)               │ 1.35x slower                   │ 2.18x (native) / 2.70x (jvm) slower     │
   ├───────────────────┼───────────────────────────────┼────────────────────────────────┼──────────────────────────────────────────┤
   │ I/O               │ posix.mmap (direct)           │ memmap2 crate (mmap)           │ MemorySegment + Foreign API (mmap)       │
   ├───────────────────┼───────────────────────────────┼────────────────────────────────┼──────────────────────────────────────────┤
@@ -238,8 +237,8 @@ Output written to target/data/output.json
   │ String alloc      │ Zero (slices into mmap)       │ Zero (borrows from mmap)       │ Minimal (intern dedup + byte[] bulk)     │
   │ during parse      │                               │                                │                                          │
   ├───────────────────┼───────────────────────────────┼────────────────────────────────┼──────────────────────────────────────────┤
-  │ Build             │ -Doptimize=ReleaseFast        │ opt-level=3, lto=true,         │ javac (JVM) / GraalVM native-image -O3   │
-  │ optimization      │                               │ codegen-units=1                │ -march=native (Native)                   │
+  │ Build             │ -Doptimize=ReleaseFast        │ opt-level=3, lto=true,         │ GraalVM native-image -O3 -march=native   │
+  │ optimization      │                               │ codegen-units=1                │ (native) / javac (jvm)                   │
   ├───────────────────┼───────────────────────────────┼────────────────────────────────┼──────────────────────────────────────────┤
   │ JVM flags         │ N/A                           │ N/A                            │ -XX:+UseParallelGC -XX:+AlwaysPreTouch   │
   │                   │                               │                                │ -XX:-TieredCompilation                   │
