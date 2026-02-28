@@ -1,0 +1,24 @@
+README.md
+  270b9bf976fb145b 218,220,222,240-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.6",
+  "base_commit_sha": "d515b4096ac325a41a78e4dd59f62e225a3d93bd",
+  "prompts": {
+    "270b9bf976fb145b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d7fd6cfb-b2ac-4f50-935e-303ddb4f4dfb",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "diegopacheco <diego.pacheco.it@gmail.com>",
+      "messages": [],
+      "total_additions": 9,
+      "total_deletions": 9,
+      "accepted_lines": 5,
+      "overriden_lines": 0,
+      "messages_url": "https://usegitai.com/cas/715d4255064c12e6279c76c1c4cb3dd48f495bfaae8ba8cbb7f689bccfbc6b3e"
+    }
+  }
+}
