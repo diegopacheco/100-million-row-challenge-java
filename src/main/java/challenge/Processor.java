@@ -16,6 +16,8 @@ import java.util.concurrent.Executors;
 
 public class Processor {
 
+    private static final int CHUNK_BUF_SIZE = 4 * 1024 * 1024;
+
     public static void process(String inputPath, String outputPath) {
         try (RandomAccessFile raf = new RandomAccessFile(inputPath, "r");
              FileChannel channel = raf.getChannel();
@@ -70,51 +72,68 @@ public class Processor {
     private static HashMap<String, LongLongMap> processChunk(MemorySegment seg, long start, long end) {
         HashMap<String, LongLongMap> map = new HashMap<>(64);
         long pos = start;
+        byte[] buf = new byte[CHUNK_BUF_SIZE];
 
         while (pos < end) {
-            long lineEnd = pos;
-            while (lineEnd < end && seg.get(ValueLayout.JAVA_BYTE, lineEnd) != '\n') {
-                lineEnd++;
+            int toRead = (int) Math.min(CHUNK_BUF_SIZE, end - pos);
+            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, pos, buf, 0, toRead);
+
+            int lastNewline = toRead;
+            if (pos + toRead < end) {
+                lastNewline = toRead - 1;
+                while (lastNewline >= 0 && buf[lastNewline] != '\n') {
+                    lastNewline--;
+                }
+                if (lastNewline < 0) {
+                    pos += toRead;
+                    continue;
+                }
+                lastNewline++;
             }
 
-            if (lineEnd > pos) {
-                long commaPos = lineEnd - 1;
-                while (commaPos > pos && seg.get(ValueLayout.JAVA_BYTE, commaPos) != ',') {
-                    commaPos--;
+            int p = 0;
+            while (p < lastNewline) {
+                int lineEnd = p;
+                while (lineEnd < lastNewline && buf[lineEnd] != '\n') {
+                    lineEnd++;
                 }
 
-                if (commaPos > pos && commaPos + 11 <= lineEnd) {
-                    long pathStart = findPathStart(seg, pos, commaPos);
-                    if (pathStart >= 0) {
-                        int pathLen = (int)(commaPos - pathStart);
-                        byte[] pathBytes = new byte[pathLen];
-                        MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, pathStart, pathBytes, 0, pathLen);
-                        String path = new String(pathBytes).intern();
+                if (lineEnd > p) {
+                    int commaPos = lineEnd - 1;
+                    while (commaPos > p && buf[commaPos] != ',') {
+                        commaPos--;
+                    }
 
-                        long dateKey = encodeDate(seg, commaPos + 1);
+                    if (commaPos > p && commaPos + 11 <= lineEnd) {
+                        int pathStart = findPathStart(buf, p, commaPos);
+                        if (pathStart >= 0) {
+                            int pathLen = commaPos - pathStart;
+                            String path = new String(buf, pathStart, pathLen).intern();
+                            long dateKey = encodeDate(buf, commaPos + 1);
 
-                        LongLongMap dates = map.get(path);
-                        if (dates == null) {
-                            dates = new LongLongMap();
-                            map.put(path, dates);
+                            LongLongMap dates = map.get(path);
+                            if (dates == null) {
+                                dates = new LongLongMap();
+                                map.put(path, dates);
+                            }
+                            dates.addTo(dateKey, 1L);
                         }
-                        dates.addTo(dateKey, 1L);
                     }
                 }
+                p = lineEnd + 1;
             }
-            pos = lineEnd + 1;
+
+            pos += lastNewline;
         }
 
         return map;
     }
 
-    private static long findPathStart(MemorySegment seg, long start, long end) {
-        for (long i = start; i < end - 2; i++) {
-            if (seg.get(ValueLayout.JAVA_BYTE, i) == ':' &&
-                seg.get(ValueLayout.JAVA_BYTE, i + 1) == '/' &&
-                seg.get(ValueLayout.JAVA_BYTE, i + 2) == '/') {
-                for (long j = i + 3; j < end; j++) {
-                    if (seg.get(ValueLayout.JAVA_BYTE, j) == '/') return j;
+    private static int findPathStart(byte[] buf, int start, int end) {
+        for (int i = start; i < end - 2; i++) {
+            if (buf[i] == ':' && buf[i + 1] == '/' && buf[i + 2] == '/') {
+                for (int j = i + 3; j < end; j++) {
+                    if (buf[j] == '/') return j;
                 }
                 return -1;
             }
@@ -122,15 +141,15 @@ public class Processor {
         return -1;
     }
 
-    private static long encodeDate(MemorySegment seg, long dateStart) {
-        int y = (seg.get(ValueLayout.JAVA_BYTE, dateStart) - '0') * 1000 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 1) - '0') * 100 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 2) - '0') * 10 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 3) - '0');
-        int m = (seg.get(ValueLayout.JAVA_BYTE, dateStart + 5) - '0') * 10 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 6) - '0');
-        int d = (seg.get(ValueLayout.JAVA_BYTE, dateStart + 8) - '0') * 10 +
-                (seg.get(ValueLayout.JAVA_BYTE, dateStart + 9) - '0');
+    private static long encodeDate(byte[] data, int dateStart) {
+        int y = (data[dateStart] - '0') * 1000 +
+                (data[dateStart + 1] - '0') * 100 +
+                (data[dateStart + 2] - '0') * 10 +
+                (data[dateStart + 3] - '0');
+        int m = (data[dateStart + 5] - '0') * 10 +
+                (data[dateStart + 6] - '0');
+        int d = (data[dateStart + 8] - '0') * 10 +
+                (data[dateStart + 9] - '0');
         return y * 10000L + m * 100L + d;
     }
 
