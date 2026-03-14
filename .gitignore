@@ -1,6 +1,9 @@
 # Compiled class file
 *.class
 
+.idea/
+100-million-row-challenge-java.iml
+
 # Log file
 *.log
 
